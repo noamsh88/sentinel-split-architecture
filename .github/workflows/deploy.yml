@@ -31,10 +31,10 @@ jobs:
       - uses: azure/setup-kubectl@v3
 
       - name: kubectl dry-run — backend
-        run: kubectl apply --dry-run=client -f kubernetes/backend/
+        run: kubectl apply --dry-run=client --validate=false -f kubernetes/backend/
 
       - name: kubectl dry-run — gateway
-        run: kubectl apply --dry-run=client -f kubernetes/gateway/
+        run: kubectl apply --dry-run=client --validate=false -f kubernetes/gateway/
 
       - name: Install kubeconform
         run: |
