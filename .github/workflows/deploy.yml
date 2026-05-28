@@ -1,0 +1,182 @@
+name: Deploy
+
+on:
+  # Runs automatically after infra apply succeeds on main
+  workflow_run:
+    workflows: [Infrastructure]
+    types: [completed]
+    branches: [main]
+  # Also allow manual re-deploy without waiting for infra
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-west-2
+
+jobs:
+  # ── Validate manifests (no cluster required) ─────────────────────────────────
+  validate-manifests:
+    name: Validate K8s Manifests
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-kubectl@v3
+
+      - name: kubectl dry-run — backend
+        run: kubectl apply --dry-run=client -f kubernetes/backend/
+
+      - name: kubectl dry-run — gateway
+        run: kubectl apply --dry-run=client -f kubernetes/gateway/
+
+      - name: Install kubeconform
+        run: |
+          curl -sSLo /tmp/kubeconform.tar.gz \
+            https://github.com/yannh/kubeconform/releases/download/v0.6.4/kubeconform-linux-amd64.tar.gz
+          tar -xzf /tmp/kubeconform.tar.gz -C /usr/local/bin kubeconform
+          kubeconform -v
+
+      - name: kubeconform — backend
+        run: |
+          kubeconform \
+            -strict \
+            -ignore-missing-schemas \
+            -summary \
+            kubernetes/backend/
+
+      - name: kubeconform — gateway
+        run: |
+          kubeconform \
+            -strict \
+            -ignore-missing-schemas \
+            -summary \
+            kubernetes/gateway/
+
+  # ── Deploy backend ───────────────────────────────────────────────────────────
+  deploy-backend:
+    name: Deploy Backend
+    runs-on: ubuntu-latest
+    needs: validate-manifests
+    outputs:
+      backend_dns: ${{ steps.get-lb.outputs.backend_dns }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: azure/setup-kubectl@v3
+
+      - name: Update kubeconfig for eks-backend
+        run: aws eks update-kubeconfig --name eks-backend --region ${{ env.AWS_REGION }}
+
+      - name: Apply backend manifests
+        run: kubectl apply -f kubernetes/backend/
+
+      - name: Wait for backend rollout
+        run: kubectl rollout status deployment/backend -n sentinel-backend --timeout=300s
+
+      - name: Wait for internal NLB hostname
+        id: get-lb
+        run: |
+          echo "Polling for NLB hostname (up to 5 minutes)..."
+          for i in $(seq 1 30); do
+            DNS=$(kubectl get svc backend -n sentinel-backend \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+            if [ -n "$DNS" ]; then
+              echo "backend_dns=$DNS" >> "$GITHUB_OUTPUT"
+              echo "Backend NLB: $DNS"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "ERROR: NLB hostname not assigned after 5 minutes" >&2
+          exit 1
+
+  # ── Deploy gateway ───────────────────────────────────────────────────────────
+  deploy-gateway:
+    name: Deploy Gateway
+    runs-on: ubuntu-latest
+    needs: deploy-backend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: azure/setup-kubectl@v3
+
+      - name: Update kubeconfig for eks-gateway
+        run: aws eks update-kubeconfig --name eks-gateway --region ${{ env.AWS_REGION }}
+
+      - name: Apply gateway namespace
+        run: kubectl apply -f kubernetes/gateway/namespace.yaml
+
+      - name: Render nginx ConfigMap with backend NLB DNS
+        env:
+          BACKEND_DNS: ${{ needs.deploy-backend.outputs.backend_dns }}
+        run: |
+          sed "s|BACKEND_DNS|${BACKEND_DNS}|g" kubernetes/gateway/configmap.yaml \
+            | kubectl apply -f -
+
+      - name: Apply gateway deployment and service
+        run: |
+          kubectl apply -f kubernetes/gateway/deployment.yaml
+          kubectl apply -f kubernetes/gateway/service.yaml
+
+      - name: Wait for gateway rollout
+        run: kubectl rollout status deployment/gateway-proxy -n sentinel-gateway --timeout=300s
+
+      - name: Wait for public NLB hostname
+        id: get-gw
+        run: |
+          echo "Polling for public NLB hostname (up to 5 minutes)..."
+          for i in $(seq 1 30); do
+            DNS=$(kubectl get svc gateway-proxy -n sentinel-gateway \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+            if [ -n "$DNS" ]; then
+              echo ""
+              echo "========================================"
+              echo " Gateway endpoint: http://$DNS"
+              echo "========================================"
+              echo "gateway_dns=$DNS" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "WARNING: public NLB hostname not yet assigned"
+
+      - name: Smoke test — proxy reaches backend
+        run: |
+          DNS=${{ steps.get-gw.outputs.gateway_dns }}
+          if [ -z "$DNS" ]; then
+            echo "Skipping smoke test — gateway DNS not yet available"
+            exit 0
+          fi
+          echo "Testing http://$DNS ..."
+          for i in $(seq 1 6); do
+            RESPONSE=$(curl -sf --max-time 10 "http://$DNS" || true)
+            if echo "$RESPONSE" | grep -q "Hello from backend"; then
+              echo "SUCCESS: proxy correctly forwarded to backend"
+              exit 0
+            fi
+            echo "Attempt $i/6 — retrying in 10s..."
+            sleep 10
+          done
+          echo "SMOKE TEST FAILED: expected 'Hello from backend' in response" >&2
+          exit 1

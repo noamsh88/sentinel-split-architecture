@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: sentinel-backend
+  annotations:
+    # Creates an internal (private) NLB via the in-tree AWS cloud provider.
+    # Traffic from the gateway VPC reaches this LB over the VPC peering link.
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    service.beta.kubernetes.io/aws-load-balancer-internal: "0.0.0.0/0"
+spec:
+  type: LoadBalancer
+  selector:
+    app: backend
+  ports:
+    - name: http
+      port: 80
+      targetPort: 5678
+      protocol: TCP

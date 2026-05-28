@@ -1,0 +1,24 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: backend-restrict-ingress
+  namespace: sentinel-backend
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  policyTypes:
+    - Ingress
+  ingress:
+    # Allow traffic that arrives via the internal NLB.
+    # With NLB + target-type:instance the source IP is preserved as the gateway
+    # node IP (10.0.0.0/16). With target-type:ip it would be the NLB node IP
+    # (10.1.0.0/16). Both ranges are allowed here; tighten once NLB mode is known.
+    - from:
+        - ipBlock:
+            cidr: 10.0.0.0/16   # gateway VPC
+        - ipBlock:
+            cidr: 10.1.0.0/16   # backend VPC (NLB node IPs when target-type=ip)
+      ports:
+        - port: 5678
+          protocol: TCP
